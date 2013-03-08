@@ -220,6 +220,16 @@ static void mptcp_sock_destruct(struct sock *sk)
 	}
 }
 
+void mptcp_destroy_sock(struct sock *sk)
+{
+	if (is_meta_sk(sk)) {
+		__skb_queue_purge(&tcp_sk(sk)->mpcb->reinject_queue);
+		mptcp_purge_ofo_queue(tcp_sk(sk));
+	} else {
+		mptcp_del_sock(sk);
+	}
+}
+
 static void mptcp_set_state(struct sock *sk)
 {
 	struct sock *meta_sk = mptcp_meta_sk(sk);
@@ -619,7 +629,7 @@ int mptcp_alloc_mpcb(struct sock *meta_sk, __u64 remote_key, u32 window)
 		newnp->ipv6_fl_list = NULL;
 		newnp->opt = NULL;
 		newnp->pktoptions = NULL;
-		xchg(&newnp->rxpmtu, NULL);
+		(void)xchg(&newnp->rxpmtu, NULL);
 	} else if (meta_sk->sk_family == AF_INET6) {
 		struct ipv6_pinfo *newnp;
 
@@ -1254,7 +1264,7 @@ void mptcp_close(struct sock *meta_sk, long timeout)
 	 */
 	while ((skb = __skb_dequeue(&meta_sk->sk_receive_queue)) != NULL) {
 		u32 len = TCP_SKB_CB(skb)->end_seq - TCP_SKB_CB(skb)->seq -
-			  (mptcp_is_data_fin(skb) ? 1 : 0);
+			  tcp_hdr(skb)->fin;
 		data_was_unread += len;
 		__kfree_skb(skb);
 	}
