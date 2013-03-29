@@ -281,7 +281,8 @@ static int mptcp_verif_dss_csum(struct sock *sk)
 			    TCP_SKB_CB(last)->seq, dss_csum_added, overflowed,
 			    iter);
 
-		tp->mptcp->csum_error = 1;
+		tp->mptcp->send_mp_fail = 1;
+
 		/* map_data_seq is the data-seq number of the
 		 * mapping we are currently checking
 		 */
@@ -291,10 +292,13 @@ static int mptcp_verif_dss_csum(struct sock *sk)
 			mptcp_send_reset(sk);
 			ans = -1;
 		} else {
-			tp->mpcb->send_mp_fail = 1;
-			tp->copied_seq = TCP_SKB_CB(last)->end_seq;
+			tp->mpcb->send_infinite_mapping = 1;
+
 			/* Need to purge the rcv-queue as it's no more valid */
-			__skb_queue_purge(&sk->sk_receive_queue);
+			while ((tmp = __skb_dequeue(&sk->sk_receive_queue)) != NULL) {
+				tp->copied_seq = TCP_SKB_CB(tmp)->end_seq;
+				kfree_skb(tmp);
+			}
 
 			ans = 0;
 		}
@@ -314,9 +318,7 @@ static inline void mptcp_prepare_skb(struct sk_buff *skb, struct sk_buff *next,
 	 * subflows. Otherwise it would be a complete mess.
 	 */
 	tcb->seq = ((u32)tp->mptcp->map_data_seq) + tcb->seq - tp->mptcp->map_subseq;
-	tcb->mp_data_len = skb->len;
-	tcb->sub_seq = tcb->seq;
-	tcb->end_seq = tcb->seq + tcb->mp_data_len;
+	tcb->end_seq = tcb->seq + skb->len;
 
 	/* If cur is the last one in the rcv-queue (or the last one for this
 	 * mapping), and data_fin is enqueued, the end_data_seq is +1.
@@ -408,7 +410,7 @@ static int mptcp_skb_split_tail(struct sk_buff *skb, struct sock *sk, u32 seq)
 	u8 flags;
 
 	len = seq - TCP_SKB_CB(skb)->seq;
-	nsize = skb_headlen(skb) - len;
+	nsize = skb_headlen(skb) - len + tcp_sk(sk)->tcp_header_len;
 	if (nsize < 0)
 		nsize = 0;
 
@@ -416,6 +418,12 @@ static int mptcp_skb_split_tail(struct sk_buff *skb, struct sock *sk, u32 seq)
 	buff = alloc_skb(nsize, GFP_ATOMIC);
 	if (buff == NULL)
 		return -ENOMEM;
+
+	skb_reserve(buff, tcp_sk(sk)->tcp_header_len);
+	skb_reset_transport_header(buff);
+
+	tcp_hdr(buff)->fin = tcp_hdr(skb)->fin;
+	tcp_hdr(skb)->fin = 0;
 
 	/* We absolutly need to call skb_set_owner_r before refreshing the
 	 * truesize of buff, otherwise the moved data will account twice.
@@ -435,9 +443,6 @@ static int mptcp_skb_split_tail(struct sk_buff *skb, struct sock *sk, u32 seq)
 
 	skb_split(skb, buff, len);
 
-	/* buff has no TCP/IP-header - thus drop the reference */
-	skb_header_release(buff);
-
 	__skb_queue_after(&sk->sk_receive_queue, skb, buff);
 
 	return 0;
@@ -453,7 +458,7 @@ static int mptcp_prevalidate_skb(struct sock *sk, struct sk_buff *skb)
 
 	/* If we are in infinite mode, the subflow-fin is in fact a data-fin. */
 	if (!skb->len && tcp_hdr(skb)->fin && !mptcp_is_data_fin(skb) &&
-	    !tp->mpcb->infinite_mapping) {
+	    !tp->mpcb->infinite_mapping_rcv) {
 		/* Remove a pure subflow-fin from the queue and increase
 		 * copied_seq.
 		 */
@@ -467,7 +472,7 @@ static int mptcp_prevalidate_skb(struct sock *sk, struct sk_buff *skb)
 	 * this segment, this path has to fallback to infinite or be torn down.
 	 */
 	if (!tp->mptcp->fully_established && !mptcp_is_data_seq(skb) &&
-	    !tp->mptcp->mapping_present && !tp->mpcb->infinite_mapping) {
+	    !tp->mptcp->mapping_present && !tp->mpcb->infinite_mapping_rcv) {
 		pr_err("%s %#x will fallback - pi %d from %pS, seq %u\n",
 		       __func__, tp->mpcb->mptcp_loc_token,
 		       tp->mptcp->path_index, __builtin_return_address(0),
@@ -480,7 +485,8 @@ static int mptcp_prevalidate_skb(struct sock *sk, struct sk_buff *skb)
 			return 1;
 		}
 
-		tp->mpcb->infinite_mapping = 1;
+		tp->mpcb->infinite_mapping_snd = 1;
+		tp->mpcb->infinite_mapping_rcv = 1;
 		tp->mptcp->fully_established = 1;
 	}
 
@@ -512,7 +518,7 @@ static int mptcp_detect_mapping(struct sock *sk, struct sk_buff *skb)
 	 * in-order at the data-level. Thus data-seq-numbers can be inferred
 	 * from what is expected at the data-level.
 	 */
-	if (mpcb->infinite_mapping) {
+	if (mpcb->infinite_mapping_rcv) {
 		tp->mptcp->map_data_seq = mptcp_get_rcv_nxt_64(meta_tp);
 		tp->mptcp->map_subseq = tcb->seq;
 		tp->mptcp->map_data_len = skb->len;
@@ -567,15 +573,16 @@ static int mptcp_detect_mapping(struct sock *sk, struct sk_buff *skb)
 	/* Mapping not yet set on this subflow - we set it here! */
 
 	if (!data_len) {
-		mpcb->infinite_mapping = 1;
+		mpcb->infinite_mapping_rcv = 1;
 		tp->mptcp->fully_established = 1;
 		/* We need to repeat mp_fail's until the sender felt
 		 * back to infinite-mapping - here we stop repeating it.
 		 */
-		mpcb->send_mp_fail = 0;
+		tp->mptcp->send_mp_fail = 0;
 
 		/* We have to fixup data_len - it must be the same as skb->len */
 		data_len = skb->len + (mptcp_is_data_fin(skb) ? 1 : 0);
+		sub_seq = tcb->seq;
 
 		/* TODO kill all other subflows than this one */
 		/* data_seq and so on are set correctly */
@@ -591,7 +598,7 @@ static int mptcp_detect_mapping(struct sock *sk, struct sk_buff *skb)
 	 * Ignore packets which do not announce the fallback and still
 	 * want to provide a mapping.
 	 */
-	if (mpcb->send_mp_fail) {
+	if (tp->mptcp->send_mp_fail) {
 		tp->copied_seq = TCP_SKB_CB(skb)->end_seq;
 		__skb_unlink(skb, &sk->sk_receive_queue);
 		__kfree_skb(skb);
@@ -792,7 +799,7 @@ static int mptcp_queue_skb(struct sock *sk)
 	}
 
 	/* Verify the checksum */
-	if (mpcb->dss_csum && !mpcb->infinite_mapping) {
+	if (mpcb->dss_csum && !mpcb->infinite_mapping_rcv) {
 		int ret = mptcp_verif_dss_csum(sk);
 
 		if (ret <= 0) {
@@ -1047,7 +1054,7 @@ static void mptcp_data_ack(struct sock *sk, const struct sk_buff *skb)
 	/* If we are in infinite mapping mode, rx_opt.data_ack has been
 	 * set by mptcp_clean_rtx_infinite.
 	 */
-	if (!(tcb->mptcp_flags & MPTCPHDR_ACK) && !tp->mpcb->infinite_mapping)
+	if (!(tcb->mptcp_flags & MPTCPHDR_ACK) && !tp->mpcb->infinite_mapping_snd)
 		goto exit;
 
 	data_ack = tp->mptcp->rx_opt.data_ack;
@@ -1150,7 +1157,7 @@ void mptcp_clean_rtx_infinite(struct sk_buff *skb, struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk), *meta_tp = tcp_sk(mptcp_meta_sk(sk));
 
-	if (!tp->mpcb->infinite_mapping)
+	if (!tp->mpcb->infinite_mapping_snd)
 		return;
 
 	/* The difference between both write_seq's represents the offset between
@@ -1159,7 +1166,7 @@ void mptcp_clean_rtx_infinite(struct sk_buff *skb, struct sock *sk)
 	 *
 	 * Thus, from this difference we can infer the meta snd_una.
 	 */
-	tp->mptcp->rx_opt.data_ack = meta_tp->write_seq - tp->write_seq +
+	tp->mptcp->rx_opt.data_ack = meta_tp->snd_nxt - tp->snd_nxt +
 				     tp->snd_una;
 
 	mptcp_data_ack(sk, skb);
@@ -1351,12 +1358,9 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 	}
 	case MPTCP_SUB_ADD_ADDR:
 	{
+#if IS_ENABLED(CONFIG_IPV6)
 		struct mp_add_addr *mpadd = (struct mp_add_addr *)ptr;
 
-		if (!mopt->mpcb)
-			break;
-
-#if IS_ENABLED(CONFIG_IPV6)
 		if ((mpadd->ipver == 4 && opsize != MPTCP_SUB_LEN_ADD_ADDR4 &&
 		     opsize != MPTCP_SUB_LEN_ADD_ADDR4 + 2) ||
 		    (mpadd->ipver == 6 && opsize != MPTCP_SUB_LEN_ADD_ADDR6 &&
@@ -1566,14 +1570,25 @@ static inline int mptcp_mp_fail_rcvd(struct sock *sk, const struct tcphdr *th)
 	if (unlikely(mptcp->rx_opt.mp_fail)) {
 		mptcp->rx_opt.mp_fail = 0;
 
-		if (!th->rst && !mpcb->infinite_mapping) {
+		if (!th->rst && !mpcb->infinite_mapping_snd) {
 			mpcb->send_infinite_mapping = 1;
 			/* We resend everything that has not been acknowledged */
 			meta_sk->sk_send_head = tcp_write_queue_head(meta_sk);
 
 			/* We artificially restart the whole send-queue. Thus,
-			 * it is as if no packets are in flight */
+			 * it is as if no packets are in flight
+			 */
 			tcp_sk(meta_sk)->packets_out = 0;
+
+			/* If the snd_nxt already wrapped around, we have to
+			 * undo the wrapping, as we are restarting from snd_una
+			 * on.
+			 */
+			if (tcp_sk(meta_sk)->snd_nxt < tcp_sk(meta_sk)->snd_una) {
+				mpcb->snd_high_order[mpcb->snd_hiseq_index] -= 2;
+				mpcb->snd_hiseq_index = mpcb->snd_hiseq_index ? 0 : 1;
+			}
+			tcp_sk(meta_sk)->snd_nxt = tcp_sk(meta_sk)->snd_una;
 		}
 
 		return 0;
@@ -1612,7 +1627,7 @@ int mptcp_handle_options(struct sock *sk, const struct tcphdr *th, struct sk_buf
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct mptcp_options_received *mopt = &tp->mptcp->rx_opt;
 
-	if (tp->mpcb->infinite_mapping)
+	if (tp->mpcb->infinite_mapping_rcv || tp->mpcb->infinite_mapping_snd)
 		return 0;
 
 	if (mptcp_mp_fail_rcvd(sk, th))

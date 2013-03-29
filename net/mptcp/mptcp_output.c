@@ -135,11 +135,13 @@ static struct sock *get_available_subflow(struct sock *meta_sk,
 		if (tp->mptcp->rcv_low_prio || tp->mptcp->low_prio)
 			cnt_backups++;
 
-		if (mptcp_dont_reinject_skb(tp, skb))
-			continue;
-
 		if (!mptcp_is_available(sk, skb))
 			continue;
+
+		if (mptcp_dont_reinject_skb(tp, skb)) {
+			backupsk = sk;
+			continue;
+		}
 
 		if ((tp->mptcp->rcv_low_prio || tp->mptcp->low_prio) &&
 		    tp->srtt < lowprio_min_time_to_peer &&
@@ -152,16 +154,21 @@ static struct sock *get_available_subflow(struct sock *meta_sk,
 			min_time_to_peer = tp->srtt;
 			bestsk = sk;
 		}
-
-		if (skb && mptcp_pi_to_flag(tp->mptcp->path_index) & TCP_SKB_CB(skb)->path_mask)
-			backupsk = sk;
 	}
 
 	if (mpcb->cnt_established == cnt_backups && lowpriosk)
 		return lowpriosk;
 	if (bestsk)
 		return bestsk;
-	return backupsk;
+	if (backupsk) {
+		/* It has been sent on all subflows once - let's give it a
+		 * chance again by restarting its pathmask.
+		 */
+		if (skb)
+			TCP_SKB_CB(skb)->path_mask = 0;
+		return backupsk;
+	}
+	return NULL;
 }
 
 static struct mp_dss *mptcp_skb_find_dss(const struct sk_buff *skb)
@@ -425,7 +432,7 @@ static void mptcp_combine_dfin(struct sk_buff *skb, struct sock *meta_sk,
 	int all_empty = 1, all_acked;
 
 	/* In infinite mapping we always try to combine */
-	if (mpcb->infinite_mapping && tcp_close_state(subsk)) {
+	if (mpcb->infinite_mapping_snd && tcp_close_state(subsk)) {
 		TCP_SKB_CB(skb)->tcp_flags |= TCPHDR_FIN;
 		return;
 	}
@@ -520,13 +527,13 @@ static struct sk_buff *mptcp_skb_entail(struct sock *sk, struct sk_buff **skb,
 	if (mptcp_is_data_fin(subskb))
 		mptcp_combine_dfin(subskb, meta_sk, sk);
 
-	if (tp->mpcb->infinite_mapping)
+	if (tp->mpcb->infinite_mapping_snd)
 		goto no_data_seq;
 
 	if (tp->mpcb->send_infinite_mapping &&
 	    tcb->seq >= mptcp_meta_tp(tp)->snd_nxt) {
 		tp->mptcp->fully_established = 1;
-		tp->mpcb->infinite_mapping = 1;
+		tp->mpcb->infinite_mapping_snd = 1;
 		tp->mptcp->infinite_cutoff_seq = tp->write_seq;
 		tcb->mptcp_flags |= MPTCPHDR_INF;
 		data_len = 0;
@@ -626,7 +633,7 @@ static void mptcp_transmit_skb_failed(struct sock *sk, struct sk_buff *skb,
 	 * There is only one subflow left and we cannot send this segment on
 	 * another subflow.
 	 */
-	if (mpcb->infinite_mapping)
+	if (mpcb->infinite_mapping_snd)
 		return;
 
 	/* If it is a reinjection, we cannot modify the path-mask
@@ -1389,7 +1396,7 @@ void mptcp_established_options(struct sock *sk, struct sk_buff *skb,
 	/* In fallback mp_fail-mode, we have to repeat it until the fallback
 	 * has been done by the sender
 	 */
-	if (unlikely(mpcb->send_mp_fail || tp->mptcp->csum_error)) {
+	if (unlikely(tp->mptcp->send_mp_fail)) {
 		opts->options |= OPTION_MPTCP;
 		opts->mptcp_options |= OPTION_MP_FAIL;
 		opts->data_ack = (__u32)(mpcb->csum_cutoff_seq >> 32);
@@ -1423,7 +1430,7 @@ void mptcp_established_options(struct sock *sk, struct sk_buff *skb,
 	 * TODO: Handle wrapped data-sequence numbers
 	 *       (even if it's very unlikely)
 	 */
-	if (mpcb->infinite_mapping && tp->mptcp->fully_established &&
+	if (mpcb->infinite_mapping_snd && tp->mptcp->fully_established &&
 	    ((mpcb->send_infinite_mapping && tcb &&
 	      !(tcb->mptcp_flags & MPTCPHDR_INF) &&
 	      !before(tcb->seq, tp->mptcp->infinite_cutoff_seq)) ||
@@ -1720,7 +1727,7 @@ struct sk_buff *mptcp_next_segment(struct sock *meta_sk, int *reinject)
 		*reinject = 0;
 
 	/* If we are in fallback-mode, just take from the meta-send-queue */
-	if (mpcb->infinite_mapping || mpcb->send_infinite_mapping)
+	if (mpcb->infinite_mapping_snd || mpcb->send_infinite_mapping)
 		return tcp_send_head(meta_sk);
 
 	skb = skb_peek(&mpcb->reinject_queue);
@@ -1810,7 +1817,7 @@ void mptcp_send_active_reset(struct sock *meta_sk, gfp_t priority)
 		return;
 
 	/* We are in infinite mode - just send a reset */
-	if (mpcb->infinite_mapping) {
+	if (mpcb->infinite_mapping_snd || mpcb->infinite_mapping_rcv) {
 		tcp_send_active_reset(sk, priority);
 		return;
 	}
@@ -2030,8 +2037,8 @@ void mptcp_retransmit_timer(struct sock *meta_sk)
 		goto send_mp_fclose;
 
 	/* In fallback, retransmission is handled at the subflow-level */
-	if (!meta_tp->packets_out ||
-	    mpcb->infinite_mapping || mpcb->send_infinite_mapping)
+	if (!meta_tp->packets_out || mpcb->infinite_mapping_snd ||
+	    mpcb->send_infinite_mapping)
 		return;
 
 	WARN_ON(tcp_write_queue_empty(meta_sk));
