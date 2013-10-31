@@ -222,6 +222,7 @@ extern void tcp_time_wait(struct sock *sk, int state, int timeo);
 #define FLAG_NONHEAD_RETRANS_ACKED      0x1000 /* Non-head rexmitted data was ACKed */
 #define FLAG_SACK_RENEGING      0x2000 /* snd_una advanced to a sacked seq */
 #define MPTCP_FLAG_SEND_RESET	0x4000
+#define MPTCP_FLAG_DATA_ACKED	0x8000
 
 #define FLAG_ACKED              (FLAG_DATA_ACKED|FLAG_SYN_ACKED)
 #define FLAG_NOT_DUP            (FLAG_DATA|FLAG_WIN_UPDATE|FLAG_ACKED)
@@ -752,6 +753,7 @@ extern u32 __tcp_select_window(struct sock *sk);
 #define MPTCPHDR_SEQ64_SET	0x10 /* Did we received a 64-bit seq number */
 #define MPTCPHDR_SEQ64_OFO	0x20 /* Is it not in our circular array? */
 #define MPTCPHDR_SEQ64_INDEX	0x40 /* Index of seq in mpcb->snd_high_order */
+#define MPTCPHDR_DSS_CSUM	0x80
 
 /* It is impossible, that all 8 bits of mptcp_flags are set to 1 with the above
  * Thus, defining MPTCPHDR_JOIN as 0xFF is safe.

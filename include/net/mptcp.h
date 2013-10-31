@@ -101,6 +101,7 @@ struct mptcp_options_received {
 	struct mptcp_cb *mpcb;
 	u16	saw_mpc:1,
 		dss_csum:1,
+		drop_me:1,
 
 		is_mp_join:1,
 		join_ack:1,
@@ -148,6 +149,7 @@ struct mptcp_tcp_sock {
 	u16	map_data_len;
 	u16	slave_sk:1,
 		fully_established:1,
+		second_packet:1,
 		attached:1,
 		send_mp_fail:1,
 		include_mpc:1,
@@ -181,6 +183,7 @@ struct mptcp_tcp_sock {
 	struct delayed_work work;
 	u32	mptcp_loc_nonce;
 	struct tcp_sock *tp; /* Where is my daddy? */
+	u32	last_end_data_seq;
 
 	/* MP_JOIN subflow: timer for retransmitting the 3rd ack */
 	struct timer_list mptcp_ack_timer;
@@ -269,6 +272,14 @@ struct mptcp_cb {
 	u32 path_index_bits;
 	/* Next pi to pick up in case a new path becomes available */
 	u8 next_path_index;
+
+	/* Original snd/rcvbuf of the initial subflow.
+	 * Used for the new subflows on the server-side to allow correct
+	 * autotuning
+	 */
+	int orig_sk_rcvbuf;
+	int orig_sk_sndbuf;
+	u32 orig_window_clamp;
 };
 
 static inline int mptcp_pi_to_flag(int pi)
@@ -384,15 +395,17 @@ struct mp_capable {
 #if defined(__LITTLE_ENDIAN_BITFIELD)
 	__u8	ver:4,
 		sub:4;
-	__u8	s:1,
-		rsv:6,
-		c:1;
+	__u8	h:1,
+		rsv:5,
+		b:1,
+		a:1;
 #elif defined(__BIG_ENDIAN_BITFIELD)
 	__u8	sub:4,
 		ver:4;
-	__u8	c:1,
-		rsv:6,
-		s:1;
+	__u8	a:1,
+		b:1,
+		rsv:5,
+		h:1;
 #else
 #error	"Adjust your <asm/byteorder.h> defines"
 #endif
@@ -718,9 +731,15 @@ static inline void mptcp_send_reset(struct sock *sk)
 	mptcp_sub_force_close(sk);
 }
 
+static inline int mptcp_is_data_seq(const struct sk_buff *skb)
+{
+	return TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_SEQ;
+}
+
 static inline int mptcp_is_data_fin(const struct sk_buff *skb)
 {
-	return TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_FIN;
+	return mptcp_is_data_seq(skb) &&
+	       (TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_FIN);
 }
 
 /* Is it a data-fin while in infinite mapping mode?
@@ -729,13 +748,8 @@ static inline int mptcp_is_data_fin(const struct sk_buff *skb)
 static inline int mptcp_is_data_fin2(const struct sk_buff *skb,
 				     const struct tcp_sock *tp)
 {
-	return (TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_FIN) ||
+	return mptcp_is_data_fin(skb) ||
 	       (tp->mpcb->infinite_mapping_rcv && tcp_hdr(skb)->fin);
-}
-
-static inline int mptcp_is_data_seq(const struct sk_buff *skb)
-{
-	return TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_SEQ;
 }
 
 static inline void mptcp_skb_entail_init(const struct tcp_sock *tp,
@@ -835,6 +849,7 @@ static inline void mptcp_init_mp_opt(struct mptcp_options_received *mopt)
 {
 	mopt->saw_mpc = 0;
 	mopt->dss_csum = 0;
+	mopt->drop_me = 0;
 
 	mopt->is_mp_join = 0;
 	mopt->join_ack = 0;
@@ -932,6 +947,7 @@ static inline void mptcp_init_buffer_space(struct sock *sk)
 
 	if (space > meta_sk->sk_rcvbuf) {
 		tcp_sk(meta_sk)->window_clamp += tcp_sk(sk)->window_clamp;
+		tcp_sk(meta_sk)->rcv_ssthresh += tcp_sk(sk)->rcv_ssthresh;
 		meta_sk->sk_rcvbuf = space;
 	}
 }
@@ -972,13 +988,14 @@ static inline void mptcp_sub_close_passive(struct sock *sk)
 	/* Only close, if the app did a send-shutdown (passive close), and we
 	 * received the data-ack of the data-fin.
 	 */
-	if (tp->mpcb->passive_close &&
-	    meta_tp->snd_una == meta_tp->write_seq)
+	if (tp->mpcb->passive_close && meta_tp->snd_una == meta_tp->write_seq)
 		mptcp_sub_close(sk, 0);
 }
 
-static inline int mptcp_fallback_infinite(struct tcp_sock *tp, int flag)
+static inline int mptcp_fallback_infinite(struct sock *sk, int flag)
 {
+	struct tcp_sock *tp = tcp_sk(sk);
+
 	/* If data has been acknowleged on the meta-level, fully_established
 	 * will have been set before and thus we will not fall back to infinite
 	 * mapping.
@@ -986,15 +1003,16 @@ static inline int mptcp_fallback_infinite(struct tcp_sock *tp, int flag)
 	if (likely(tp->mptcp->fully_established))
 		return 0;
 
-	if (!(flag & FLAG_DATA_ACKED))
+	if (!(flag & MPTCP_FLAG_DATA_ACKED))
 		return 0;
 
 	/* Don't fallback twice ;) */
 	if (tp->mpcb->infinite_mapping_snd)
 		return 0;
 
-	pr_err("%s %#x will fallback - pi %d from %pS\n", __func__,
-	       tp->mpcb->mptcp_loc_token, tp->mptcp->path_index,
+	pr_err("%s %#x will fallback - pi %d, src %pI4 dst %pI4 from %pS\n",
+	       __func__, tp->mpcb->mptcp_loc_token, tp->mptcp->path_index,
+	       &inet_sk(sk)->inet_saddr, &inet_sk(sk)->inet_daddr,
 	       __builtin_return_address(0));
 	if (!is_master_tp(tp))
 		return MPTCP_FLAG_SEND_RESET;
@@ -1062,7 +1080,7 @@ static inline u8 mptcp_set_new_pathindex(struct mptcp_cb *mpcb)
 static inline int mptcp_v6_is_v4_mapped(struct sock *sk)
 {
 	return sk->sk_family == AF_INET6 &&
-		ipv6_addr_type(&inet6_sk(sk)->saddr) == IPV6_ADDR_MAPPED;
+	       ipv6_addr_type(&inet6_sk(sk)->saddr) == IPV6_ADDR_MAPPED;
 }
 #else /* CONFIG_MPTCP */
 #define mptcp_debug(fmt, args...)	\
@@ -1184,7 +1202,7 @@ static inline int mptcp_select_size(const struct sock *meta_sk)
 }
 static inline void mptcp_key_sha1(u64 key, u32 *token, u64 *idsn) {}
 static inline void mptcp_sub_close_passive(struct sock *sk) {}
-static inline int mptcp_fallback_infinite(const struct tcp_sock *tp, int flag)
+static inline int mptcp_fallback_infinite(const struct sock *sk, int flag)
 {
 	return 0;
 }
